@@ -154,7 +154,16 @@ FrankaSafetyNode::FrankaSafetyNode() : Node("franka_controller_node")
       rclcpp::shutdown();
       return;
     }
-    Eigen::VectorXd q_init = Eigen::Map<Eigen::VectorXd>(init_joint_position_vec.data(), 7);
+    Eigen::VectorXd q_init = Eigen::VectorXd::Zero(model_.nv);
+    for (int i = 0; i < 7; ++i)
+    {
+      std::string name = arm_prefix_ + "fr3_joint" + std::to_string(i + 1);
+      if (model_.existJointName(name))
+      {
+        int idx = model_.joints[model_.getJointId(name)].idx_q();
+        q_init(idx) = init_joint_position_vec[i];
+      }
+    }
     pinocchio::forwardKinematics(model_, *data_, q_init);
     pinocchio::updateFramePlacements(model_, *data_);
     Eigen::Vector3d init_cartesian = data_->oMf[ee_frame_id_].translation();
