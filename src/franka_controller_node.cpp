@@ -262,6 +262,8 @@ void FrankaSafetyNode::policyTargetDQCallback(const sensor_msgs::msg::JointState
     is_policy_active_ = true;
   }
   last_policy_msg_time_ = this->get_clock()->now();
+  // Policy/replay control must work even if teleop (targetDQCallback) is not used
+  received_first_command_ = true;
 
   policy_target_dq_ = Eigen::VectorXd::Zero(model_.nv);
 
