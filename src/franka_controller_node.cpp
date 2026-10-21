@@ -71,6 +71,7 @@ private:
   pinocchio::Model model_;
   std::unique_ptr<pinocchio::Data> data_;
   pinocchio::FrameIndex ee_frame_id_;
+  std::string end_effector_frame_;
 
   SafetyLayer safety_layer_;
 };
@@ -83,8 +84,10 @@ FrankaSafetyNode::FrankaSafetyNode() : Node("franka_controller_node")
   this->declare_parameter("max_spring_stretch", 0.1);
   this->declare_parameter("timer_dt", 0.005);
   this->declare_parameter("bypass_safety", false);
+  this->declare_parameter("end_effector_frame", "");
 
   arm_prefix_ = this->get_parameter("arm_prefix").as_string();
+  end_effector_frame_ = this->get_parameter("end_effector_frame").as_string();
   if (!arm_prefix_.empty() && arm_prefix_.back() != '_')
     arm_prefix_ += "_";
 
@@ -187,10 +190,21 @@ bool FrankaSafetyNode::loadPinocchioModel()
 {
   if (!robot_safety_layer::ModelLoader::loadPinocchioModel(this, model_, data_))
     return false;
-  std::string ee_name = arm_prefix_ + "fr3_link8";
-  if (!model_.existFrame(ee_name))
+  // Must match the frame the IK layer controls, or safety is evaluated at a different
+  // point on the arm than the one being commanded.
+  if (end_effector_frame_.empty())
+  {
+    end_effector_frame_ = arm_prefix_ + "grasp_point";
+    RCLCPP_WARN(this->get_logger(), "end_effector_frame parameter not set. Falling back to default: %s",
+                end_effector_frame_.c_str());
+  }
+  if (!model_.existFrame(end_effector_frame_))
+  {
+    RCLCPP_ERROR(this->get_logger(), "End effector frame '%s' not found in model.",
+                 end_effector_frame_.c_str());
     return false;
-  ee_frame_id_ = model_.getFrameId(ee_name);
+  }
+  ee_frame_id_ = model_.getFrameId(end_effector_frame_);
   return true;
 }
 
