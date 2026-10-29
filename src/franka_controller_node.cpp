@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <franka_custom_msgs/msg/fijk_debug.hpp>
 #include <franka_custom_msgs/srv/set_pose_stamped.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -34,6 +35,8 @@ private:
   void otherJointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
   void policyTargetDQCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
   void targetDQCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
+  void haltCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void publishHoldTarget();
   void targetPoseServiceCallback(const std::shared_ptr<franka_custom_msgs::srv::SetPoseStamped::Request> request,
                                  std::shared_ptr<franka_custom_msgs::srv::SetPoseStamped::Response> response);
 
@@ -48,6 +51,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr other_joint_state_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr target_dq_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr policy_target_dq_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr halt_sub_;
 
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -71,6 +75,12 @@ private:
   pinocchio::Model model_;
   std::unique_ptr<pinocchio::Data> data_;
   pinocchio::FrameIndex ee_frame_id_;
+  // The IK node's end-effector frame (its target_pose frame), for the hold target on resume
+  pinocchio::FrameIndex ik_frame_id_;
+
+  // Halt (/robot_halt, latched, from the studio's Stop): the joint command is frozen and every
+  // input (IK, policy, target_pose) is ignored until it is released.
+  bool halted_ = false;
 
   SafetyLayer safety_layer_;
 };
@@ -136,6 +146,11 @@ FrankaSafetyNode::FrankaSafetyNode() : Node("franka_controller_node")
   policy_target_dq_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
       "policy_target_dq", 1, std::bind(&FrankaSafetyNode::policyTargetDQCallback, this, std::placeholders::_1));
 
+  // Global (both arms), latched so a node started while halted is halted too
+  halt_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      "/robot_halt", rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&FrankaSafetyNode::haltCallback, this, std::placeholders::_1));
+
   other_joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
       "/" + other_ns_ + "/joint_states", 1,
       std::bind(&FrankaSafetyNode::otherJointStateCallback, this, std::placeholders::_1));
@@ -191,7 +206,50 @@ bool FrankaSafetyNode::loadPinocchioModel()
   if (!model_.existFrame(ee_name))
     return false;
   ee_frame_id_ = model_.getFrameId(ee_name);
+  const std::string ik_name = arm_prefix_ + "rh_p12_rn_grasp_point";
+  ik_frame_id_ = model_.existFrame(ik_name) ? model_.getFrameId(ik_name) : ee_frame_id_;
   return true;
+}
+
+void FrankaSafetyNode::haltCallback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  if (msg->data == halted_)
+    return;
+  if (msg->data)
+  {
+    halted_ = true;
+    is_policy_active_ = false;
+    RCLCPP_WARN(this->get_logger(), "HALT: holding the current joint command, all inputs ignored.");
+    return;
+  }
+  // Resume: give the IK node the held pose first, so it does not drive back to an old target
+  publishHoldTarget();
+  target_dq_ik_.setZero();
+  policy_target_dq_.setZero();
+  halted_ = false;
+  RCLCPP_INFO(this->get_logger(), "Resumed: IK re-targeted at the held pose.");
+}
+
+void FrankaSafetyNode::publishHoldTarget()
+{
+  const Eigen::VectorXd& q = (q_cmd_.size() == model_.nv) ? q_cmd_ : q_;
+  if (q.size() != model_.nv || !q.allFinite())
+    return;
+  pinocchio::forwardKinematics(model_, *data_, q);
+  pinocchio::updateFramePlacements(model_, *data_);
+  const pinocchio::SE3& pose = data_->oMf[ik_frame_id_];
+  geometry_msgs::msg::PoseStamped hold;
+  hold.header.stamp = this->get_clock()->now();
+  hold.header.frame_id = "world";
+  hold.pose.position.x = pose.translation().x();
+  hold.pose.position.y = pose.translation().y();
+  hold.pose.position.z = pose.translation().z();
+  Eigen::Quaterniond quat(pose.rotation());
+  hold.pose.orientation.w = quat.w();
+  hold.pose.orientation.x = quat.x();
+  hold.pose.orientation.y = quat.y();
+  hold.pose.orientation.z = quat.z();
+  safe_target_pose_pub_->publish(hold);
 }
 
 bool FrankaSafetyNode::loadOtherPinocchioModel(const std::string& other_ns)
@@ -254,6 +312,9 @@ void FrankaSafetyNode::policyTargetDQCallback(const sensor_msgs::msg::JointState
                          "Policy action too small! Got %zu, expected at least 7", msg->position.size());
     return;
   }
+
+  if (halted_)
+    return;
 
   // 2. Claim control and reset watchdog
   if (!is_policy_active_)
@@ -332,6 +393,13 @@ void FrankaSafetyNode::targetPoseServiceCallback(
     const std::shared_ptr<franka_custom_msgs::srv::SetPoseStamped::Request> request,
     std::shared_ptr<franka_custom_msgs::srv::SetPoseStamped::Response> response)
 {
+  if (halted_)
+  {
+    response->success = false;
+    response->message = "Halted (/robot_halt): target ignored until resumed.";
+    return;
+  }
+
   // 1. Apply proactive safety: slide the desired pose away from obstacles
   geometry_msgs::msg::PoseStamped safe_msg = request->pose;
   if (!bypass_safety_ && q_cmd_.size() == model_.nv)
@@ -392,7 +460,11 @@ void FrankaSafetyNode::controlLoop()
 
   // Arbiter
   Eigen::VectorXd active_dq;
-  if (is_policy_active_)
+  if (halted_)
+  {
+    active_dq = Eigen::VectorXd::Zero(model_.nv);   // hold q_cmd_ (still published below)
+  }
+  else if (is_policy_active_)
   {
     if ((now - last_policy_msg_time_).seconds() > 0.25)
     {
