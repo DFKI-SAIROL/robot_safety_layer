@@ -60,6 +60,7 @@ private:
   std::string other_ns_;
   double joint_velocity_limit_ = 1.0;
   double max_spring_stretch_ = 0.1;
+  double joint_limit_margin_ = 0.1;  // [rad] Commanded joints stay this far inside the URDF limits
   double timer_dt_ = 0.005;
   bool bypass_safety_ = false;
 
@@ -91,6 +92,7 @@ FrankaSafetyNode::FrankaSafetyNode() : Node("franka_controller_node")
   this->declare_parameter("arm_prefix", "");
   this->declare_parameter("joint_velocity_limit", 1.0);
   this->declare_parameter("max_spring_stretch", 0.1);
+  this->declare_parameter("joint_limit_margin", 0.1);
   this->declare_parameter("timer_dt", 0.005);
   this->declare_parameter("bypass_safety", false);
 
@@ -100,6 +102,7 @@ FrankaSafetyNode::FrankaSafetyNode() : Node("franka_controller_node")
 
   joint_velocity_limit_ = this->get_parameter("joint_velocity_limit").as_double();
   max_spring_stretch_ = this->get_parameter("max_spring_stretch").as_double();
+  joint_limit_margin_ = this->get_parameter("joint_limit_margin").as_double();
   timer_dt_ = this->get_parameter("timer_dt").as_double();
   bypass_safety_ = this->get_parameter("bypass_safety").as_bool();
 
@@ -513,6 +516,7 @@ void FrankaSafetyNode::controlLoop()
     std::string name = arm_prefix_ + "fr3_joint" + std::to_string(i + 1);
     cmd.name[i] = name;
     int idx = model_.joints[model_.getJointId(name)].idx_q();
+    double q_cmd_prev = q_cmd_(idx);
     q_cmd_(idx) += active_dq(idx) * timer_dt_;
 
     double error = q_cmd_(idx) - q_(idx);
@@ -521,8 +525,24 @@ void FrankaSafetyNode::controlLoop()
     else if (error < -max_spring_stretch_)
       q_cmd_(idx) = q_(idx) - max_spring_stretch_;
 
+    // Joint limits: never command past limit -/+ margin. If the command is already outside
+    // (e.g. robot started there), it may only move back inward, so there is no jump.
+    double upper = model_.upperPositionLimit(idx) - joint_limit_margin_;
+    double lower = model_.lowerPositionLimit(idx) + joint_limit_margin_;
+    double joint_dq = active_dq(idx);
+    if (q_cmd_(idx) > upper)
+    {
+      q_cmd_(idx) = std::max(upper, std::min(q_cmd_(idx), q_cmd_prev));
+      joint_dq = std::min(joint_dq, 0.0);
+    }
+    else if (q_cmd_(idx) < lower)
+    {
+      q_cmd_(idx) = std::min(lower, std::max(q_cmd_(idx), q_cmd_prev));
+      joint_dq = std::max(joint_dq, 0.0);
+    }
+
     cmd.position[i] = q_cmd_(idx);
-    cmd.velocity[i] = active_dq(idx);
+    cmd.velocity[i] = joint_dq;
   }
 
   target_joint_pub_->publish(cmd);
