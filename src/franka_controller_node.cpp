@@ -471,8 +471,12 @@ void FrankaSafetyNode::controlLoop()
   {
     if ((now - last_policy_msg_time_).seconds() > 0.25)
     {
-      RCLCPP_WARN(this->get_logger(), "Policy timeout. Reverting to IK.");
+      // The policy moved the arm away from the IK's last target. Hand over at the held pose,
+      // otherwise the IK pulls the arm back to the target it had before the policy took over.
+      RCLCPP_WARN(this->get_logger(), "Policy timeout. Reverting to IK at the held pose.");
       is_policy_active_ = false;
+      publishHoldTarget();
+      target_dq_ik_.setZero();
       active_dq = target_dq_ik_;
     }
     else
