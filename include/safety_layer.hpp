@@ -49,8 +49,10 @@ public:
 
     WorkspaceVisualizer vis_;
 
-    double current_distance_to_obstacle;
-    double current_distance_to_obstacle_along_velocity_direction;
+    // NaN until getMaxSafeVelocity() runs, which it never does under bypass_safety.
+    // Not 0.0: a reader would take that for "touching an obstacle".
+    double current_distance_to_obstacle = std::numeric_limits<double>::quiet_NaN();
+    double current_distance_to_obstacle_along_velocity_direction = std::numeric_limits<double>::quiet_NaN();
 
     // --- Other Obstacle Members ---
     bool other_robot_check = false;
